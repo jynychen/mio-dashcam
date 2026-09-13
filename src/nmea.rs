@@ -14,6 +14,11 @@
 //! course and — importantly — the **date**, which makes each record an absolute
 //! UTC instant and lets a recording be stitched across midnight.
 //!
+//! Sentence framing, checksum verification and field decoding are handled by the
+//! [`nmea`] crate; this module narrows its `RmcData` to the few fields the
+//! overlay uses and keeps the "one record per second, gaps included" shape the
+//! rest of the pipeline expects.
+//!
 //! Note the clock mismatch: RMC timestamps are UTC while the file *name* is the
 //! camera's local time.  [`crate::gps`] reconciles the two.
 
@@ -22,14 +27,16 @@ use std::io::{BufRead, BufReader};
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use chrono::{NaiveDate, NaiveDateTime};
+use chrono::{NaiveDateTime, Timelike};
+use nmea::ParseResult;
+use nmea::sentences::rmc::RmcStatusOfFix;
 
 /// One 1 Hz RMC record.
 #[derive(Debug, Clone)]
 pub struct Rmc {
     /// Absolute UTC instant (date + time fields combined).
     pub utc: NaiveDateTime,
-    /// `true` when the receiver reported a valid fix (status `A`).
+    /// `true` when the receiver reported a valid fix (status `A` or `D`).
     pub fix: bool,
     /// Decimal degrees, WGS-84. `NaN` without a fix.
     pub lat: f64,
@@ -64,19 +71,27 @@ pub fn parse_file(path: &Path) -> Result<Vec<Rmc>> {
 /// Parse a single line if it is a valid RMC sentence.
 ///
 /// Any talker ID is accepted (`$GNRMC` from the multi-constellation receiver,
-/// `$GPRMC` from GPS-only firmware).
+/// `$GPRMC` from GPS-only firmware).  Every other sentence — including the
+/// vendor-specific `$GSENSORD` accelerometer line — fails to parse and is
+/// dropped, as is a sentence whose checksum does not match.
+///
+/// A record without both a date and a time is dropped too: the overlay indexes
+/// records by absolute instant, so a timestamp that cannot be placed on the
+/// calendar is of no use.
+///
+/// The sub-second part of the time is dropped: the receiver emits one record per
+/// second and the fractional offset (`.849`, `.000`, …) drifts between clips, so
+/// keeping it would add jitter to the interpolation without adding information.
 fn parse_rmc(line: &str) -> Option<Rmc> {
-    let body = verified_body(line.trim())?;
-    let f: Vec<&str> = body.split(',').collect();
-
-    // f[0] = talker + sentence id, then: time, status, lat, N/S, lon, E/W,
-    // speed(kn), course, date.
-    if f.len() < 10 || f[0].len() != 5 || !f[0].ends_with("RMC") {
+    let ParseResult::RMC(data) = nmea::parse_str(line.trim()).ok()? else {
         return None;
-    }
+    };
 
-    let utc = decode_datetime(f[9], f[1])?;
-    let fix = f[2].eq_ignore_ascii_case("A");
+    let utc = data.fix_date?.and_time(data.fix_time?.with_nanosecond(0)?);
+    let fix = matches!(
+        data.status_of_fix,
+        RmcStatusOfFix::Autonomous | RmcStatusOfFix::Differential
+    );
 
     if !fix {
         return Some(Rmc {
@@ -92,58 +107,15 @@ fn parse_rmc(line: &str) -> Option<Rmc> {
     Some(Rmc {
         utc,
         fix,
-        lat: decode_coord(f[3], f[4])?,
-        lon: decode_coord(f[5], f[6])?,
+        lat: data.lat?,
+        lon: data.lon?,
         // A fixed receiver leaves course empty — that is not a broken sentence,
         // so fall back to NaN and let the heading spline ignore the record.
-        speed: f[7].parse::<f64>().ok().map_or(f64::NAN, |kn| kn * 1.852),
-        track: f[8].parse::<f64>().unwrap_or(f64::NAN),
+        speed: data
+            .speed_over_ground
+            .map_or(f64::NAN, |kn| f64::from(kn) * 1.852),
+        track: data.true_course.map_or(f64::NAN, f64::from),
     })
-}
-
-/// Strip the `$` prefix and `*XX` suffix, verifying the XOR checksum.
-///
-/// A sentence without a checksum is accepted as-is; one with a checksum that
-/// does not match is rejected.
-fn verified_body(line: &str) -> Option<&str> {
-    let body = line.strip_prefix('$')?;
-    let Some((payload, checksum)) = body.rsplit_once('*') else {
-        return Some(body);
-    };
-    let expected = u8::from_str_radix(checksum.get(..2)?, 16).ok()?;
-    let actual = payload.bytes().fold(0u8, |acc, b| acc ^ b);
-    (actual == expected).then_some(payload)
-}
-
-/// Combine the `ddmmyy` date field and the `hhmmss.sss` time field.
-///
-/// The sub-second part is dropped: the receiver emits one record per second and
-/// the fractional offset (`.849`, `.000`, …) drifts between clips, so keeping it
-/// would add jitter to the interpolation without adding information.
-fn decode_datetime(date: &str, time: &str) -> Option<NaiveDateTime> {
-    if date.len() < 6 || time.len() < 6 {
-        return None;
-    }
-    let day = date[0..2].parse().ok()?;
-    let month = date[2..4].parse().ok()?;
-    let year = 2000 + date[4..6].parse::<i32>().ok()?;
-    NaiveDate::from_ymd_opt(year, month, day)?.and_hms_opt(
-        time[0..2].parse().ok()?,
-        time[2..4].parse().ok()?,
-        time[4..6].parse().ok()?,
-    )
-}
-
-/// Convert an NMEA `ddmm.mmmm` / `dddmm.mmmm` coordinate to decimal degrees.
-fn decode_coord(value: &str, hemisphere: &str) -> Option<f64> {
-    let raw: f64 = value.parse().ok()?;
-    let degrees = (raw / 100.0).trunc();
-    let dd = degrees + (raw - degrees * 100.0) / 60.0;
-    match hemisphere {
-        "S" | "W" => Some(-dd),
-        "N" | "E" => Some(dd),
-        _ => None,
-    }
 }
 
 #[cfg(test)]
@@ -160,7 +132,7 @@ mod tests {
         assert!((r.lat - 25.129573).abs() < 1e-5, "lat was {}", r.lat);
         assert!((r.lon - 121.404892).abs() < 1e-5, "lon was {}", r.lon);
         assert!((r.speed - 1.31492).abs() < 1e-4);
-        assert!((r.track - 330.64).abs() < 1e-9);
+        assert!((r.track - 330.64).abs() < 1e-4);
     }
 
     #[test]
@@ -169,6 +141,15 @@ mod tests {
         assert!(!r.fix);
         assert!(r.lat.is_nan() && r.lon.is_nan());
         assert_eq!(r.utc.to_string(), "2026-08-20 12:57:21");
+    }
+
+    #[test]
+    fn southern_and_western_hemispheres_are_negative() {
+        let r =
+            parse_rmc("$GPRMC,134607.655,A,2507.7744,S,12124.2935,W,0.71,330.64,200826,,,A,V*19")
+                .unwrap();
+        assert!((r.lat + 25.129573).abs() < 1e-5, "lat was {}", r.lat);
+        assert!((r.lon + 121.404892).abs() < 1e-5, "lon was {}", r.lon);
     }
 
     #[test]
@@ -188,9 +169,10 @@ mod tests {
     }
 
     #[test]
-    fn southern_and_western_hemispheres_are_negative() {
-        assert!((decode_coord("2507.7744", "S").unwrap() + 25.129573).abs() < 1e-5);
-        assert!((decode_coord("12124.2935", "W").unwrap() + 121.404892).abs() < 1e-5);
-        assert!(decode_coord("2507.7744", "").is_none());
+    fn drops_a_record_without_a_date() {
+        assert!(
+            parse_rmc("$GNRMC,134607.655,A,2507.7744,N,12124.2935,E,0.71,330.64,,,,A,V*06")
+                .is_none()
+        );
     }
 }
