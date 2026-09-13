@@ -4,12 +4,16 @@
 
 mod ffmpeg;
 mod ffprobe;
+mod filters;
 mod gps;
+mod mercator;
+mod motion;
 mod name;
 mod nmea;
 mod organize;
 mod overlay;
 mod scan;
+mod track;
 
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -325,29 +329,52 @@ fn render_overlay(
 ) -> Result<Option<PathBuf>> {
     println!("--- parsing GPS ---");
     let session = gps::load_session(group, opts.tz)?;
-    if session.record_count() == 0 {
+    if session.record_count == 0 {
         // No records means no timezone was inferred; don't report a made-up one.
         println!("no usable records in the NMEA logs");
     } else {
         println!(
             "{} records, {} with a fix, time zone {}",
-            session.record_count(),
-            session.fix_count,
+            session.record_count,
+            session.fixes.len(),
             session.tz
         );
     }
-    if session.fix_count < 2 {
+
+    let motion = motion::MotionSeries::from_fixes(&session.fixes);
+    let Some(layout) = track::build(
+        &session,
+        &motion,
+        opts.overlay_size,
+        info.fps,
+        info.duration,
+    ) else {
         println!("not enough fixes, skipping the overlay");
         return Ok(None);
-    }
+    };
 
-    let track = gps::build_track(&session, info.fps, info.duration);
+    print_motion(&motion);
     println!(
         "--- rendering the track, {} ---",
-        count(track.len(), "frame")
+        count(layout.frames.len(), "frame")
     );
-    let path = overlay::render(&track, opts.output, name, info.fps, opts.overlay_size)?;
+    let path = overlay::render(&layout, opts.output, name, info.fps)?;
     Ok(Some(path))
+}
+
+/// Report what the derived motion channels saw over the drive.
+fn print_motion(motion: &motion::MotionSeries) {
+    let peak = |values: &[f64]| match motion::extremes(values) {
+        Some((lo, hi)) => lo.abs().max(hi.abs()),
+        None => 0.0,
+    };
+    let top_speed = motion::extremes(&motion.speed).map_or(0.0, |(_, hi)| hi);
+    println!(
+        "top speed {:.0} km/h, peak {:.2} g lateral, {:.2} g longitudinal",
+        top_speed * 3.6,
+        peak(&motion.lateral_acc) / filters::G,
+        peak(&motion.longitudinal_acc) / filters::G,
+    );
 }
 
 /// Scan the input, split it into sessions and apply `--select`.

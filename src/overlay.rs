@@ -5,9 +5,13 @@
 //! polyline: the part already driven is thick and white, the part still ahead is
 //! thin and grey, and an arrow marks the current position and heading.
 //!
-//! Ported from the masigo-dashcam renderer.  Everything is drawn with signed
-//! distance fields and composited in linear light with premultiplied alpha, so
-//! the result survives being scaled and blended over 4K footage.
+//! Everything is drawn with signed distance fields and composited in linear
+//! light with premultiplied alpha, so the result survives being scaled and
+//! blended over 4K footage.
+//!
+//! What to draw is decided in [`crate::track`]: this module receives a
+//! [`TrackLayout`] already projected into the frame and is only responsible for
+//! turning it into pixels.
 
 use std::cell::RefCell;
 use std::io::Write;
@@ -17,12 +21,13 @@ use std::process::{Command, Stdio};
 use anyhow::{Context, Result, bail};
 use rayon::prelude::*;
 
-use crate::gps::{PositionSource, TrackPoint};
+use crate::gps::PositionSource;
+use crate::track::{MarkerFrame, Segment, TrackLayout};
 
-/// Fraction of the frame left blank around the track's bounding box.
-const PADDING_RATIO: f64 = 0.05;
-/// How long a segment takes to switch from "ahead" to "behind" styling.
-const FADE_SECS: f64 = 0.25;
+/// How much of the track immediately behind the vehicle is left undrawn, in
+/// seconds.  The arrow covers the seam, so neither styling needs to meet the
+/// marker exactly.
+const TRAIL_GAP_SECS: f32 = 0.25;
 
 // ── Visual parameters ─────────────────────────────────────────────────────────
 // Colors are linear-light; compositing uses premultiplied alpha (Porter-Duff).
@@ -65,63 +70,27 @@ impl ColorLinA {
     }
 }
 
-/// One frame of the track projected into pixel space.
-struct PixelFrame {
-    /// `NAN` when the frame has no drawable position.
-    x: f32,
-    y: f32,
-    heading: f32,
-    /// Gap-filled positions get the neutral arrow colour instead of red.
-    interpolated: bool,
-}
-
 thread_local! {
     /// Per-thread f32 scratch buffer, reused across frames to keep the render
     /// loop allocation-free.  A rayon worker only ever touches its own.
     static WORK_BUF: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
 }
 
-/// Render `track` to a transparent overlay video and return its path.
-///
-/// `track` must hold exactly one point per output frame.
-pub fn render(
-    track: &[TrackPoint],
-    output_dir: &Path,
-    name: &str,
-    fps: f64,
-    size: u32,
-) -> Result<PathBuf> {
+/// Render `layout` to a transparent overlay video and return its path.
+pub fn render(layout: &TrackLayout, output_dir: &Path, name: &str, fps: f64) -> Result<PathBuf> {
     if fps <= 0.0 {
         bail!("fps must be positive (got {fps})");
     }
-    if track.is_empty() {
+    if layout.frames.is_empty() {
         bail!("no GPS frames to render");
     }
+    if layout.segments.is_empty() {
+        bail!("no GPS track to render");
+    }
 
+    let size = layout.size;
     let output_file = output_dir.join(format!("{name}_overlay.mov"));
-
-    // One viewport for the whole video: the map must not drift under the track.
-    let viewport =
-        Viewport::fit(track, size).context("no usable GPS positions for the overlay viewport")?;
-
-    let frames_px: Vec<PixelFrame> = track
-        .iter()
-        .map(|p| {
-            let (x, y) = if p.drawable() {
-                viewport.to_pixel(p.lat, p.lon)
-            } else {
-                (f32::NAN, f32::NAN)
-            };
-            PixelFrame {
-                x,
-                y,
-                heading: p.heading as f32,
-                interpolated: p.source == PositionSource::Interpolated,
-            }
-        })
-        .collect();
-
-    let raster = TrackRaster::precompute(&frames_px, size, TRACK_RADIUS_THICK);
+    let raster = TrackRaster::precompute(&layout.segments, size, TRACK_RADIUS_THICK);
 
     let mut ffmpeg = Command::new("ffmpeg")
         .args([
@@ -155,13 +124,12 @@ pub fn render(
 
     let stdin = ffmpeg.stdin.as_mut().context("no ffmpeg stdin")?;
     let frame_len = (size * size * 4) as usize;
-    let fade_frames = (FADE_SECS * fps).round().max(1.0) as u32;
     // Two chunks per thread keeps every core busy without buffering the world.
     let chunk_size = rayon::current_num_threads() * 2;
 
     let result = (|| -> Result<()> {
-        for chunk_start in (0..frames_px.len()).step_by(chunk_size) {
-            let chunk_end = (chunk_start + chunk_size).min(frames_px.len());
+        for chunk_start in (0..layout.frames.len()).step_by(chunk_size) {
+            let chunk_end = (chunk_start + chunk_size).min(layout.frames.len());
             let chunk: Vec<Vec<u8>> = (chunk_start..chunk_end)
                 .into_par_iter()
                 .map(|frame_idx| {
@@ -169,15 +137,7 @@ pub fn render(
                     WORK_BUF.with(|cell| {
                         let mut work = cell.borrow_mut();
                         work.resize(frame_len, 0.0);
-                        render_frame(
-                            &mut buf,
-                            &mut work,
-                            &raster,
-                            &frames_px,
-                            frame_idx,
-                            size,
-                            fade_frames,
-                        );
+                        render_frame(&mut buf, &mut work, &raster, layout, frame_idx, fps as f32);
                     });
                     buf
                 })
@@ -201,67 +161,6 @@ pub fn render(
     Ok(output_file)
 }
 
-// ── Viewport: degrees → pixels ────────────────────────────────────────────────
-// Equirectangular projection with a cos(lat) correction, which is accurate well
-// past the tens-of-kilometres scale of a dashcam session.
-
-struct Viewport {
-    center_lat: f64,
-    center_lon: f64,
-    px_per_deg_lat: f64,
-    px_per_deg_lon: f64,
-    half: f64,
-}
-
-impl Viewport {
-    fn fit(track: &[TrackPoint], size: u32) -> Option<Self> {
-        let mut positions = track
-            .iter()
-            .filter(|p| p.drawable())
-            .map(|p| (p.lat, p.lon));
-
-        let (first_lat, first_lon) = positions.next()?;
-        let (min_lat, max_lat, min_lon, max_lon) = positions.fold(
-            (first_lat, first_lat, first_lon, first_lon),
-            |(mn_la, mx_la, mn_lo, mx_lo), (lat, lon)| {
-                (
-                    mn_la.min(lat),
-                    mx_la.max(lat),
-                    mn_lo.min(lon),
-                    mx_lo.max(lon),
-                )
-            },
-        );
-
-        let center_lat = (min_lat + max_lat) / 2.0;
-        let center_lon = (min_lon + max_lon) / 2.0;
-
-        // A degree of longitude shrinks toward the poles: 111 km × cos(lat),
-        // against a constant 111 km for latitude.
-        let cos_lat = center_lat.to_radians().cos().abs().max(1e-6);
-        let span_lat = (max_lat - min_lat).max(1e-6);
-        let span_lon = (max_lon - min_lon).max(1e-6) * cos_lat;
-
-        // Scale both axes from the dominant one so the track is not distorted.
-        let usable = size as f64 * (1.0 - 2.0 * PADDING_RATIO);
-        let px_per_deg_lat = usable / span_lat.max(span_lon);
-
-        Some(Viewport {
-            center_lat,
-            center_lon,
-            px_per_deg_lat,
-            px_per_deg_lon: px_per_deg_lat * cos_lat,
-            half: size as f64 / 2.0,
-        })
-    }
-
-    fn to_pixel(&self, lat: f64, lon: f64) -> (f32, f32) {
-        let x = self.half + (lon - self.center_lon) * self.px_per_deg_lon;
-        let y = self.half - (lat - self.center_lat) * self.px_per_deg_lat;
-        (x as f32, y as f32)
-    }
-}
-
 // ── Track pre-computation ─────────────────────────────────────────────────────
 //
 // The polyline is identical in every frame; only its past/future split moves.
@@ -276,22 +175,26 @@ impl Viewport {
 
 struct TrackRaster {
     /// `(segment index, distance from pixel centre)`.  Only the raw distance is
-    /// kept — coverage is derived per frame so the fade can vary the radius.
+    /// kept — coverage is derived per frame so past and future can differ in
+    /// width.
     entries: Vec<(u32, f32)>,
     /// CSR row pointers; length `size² + 1`, last element is the entry count.
     offsets: Vec<u32>,
+    /// `(t0, t1)` per segment, split out of the geometry so the per-frame
+    /// past/future test walks 8 bytes a segment instead of 24.
+    spans: Vec<(f32, f32)>,
 }
 
 impl TrackRaster {
     /// `max_radius` is the widest half-width ever drawn; it decides which
     /// pixels are recorded at all.
-    fn precompute(track: &[PixelFrame], size: u32, max_radius: f32) -> Self {
+    fn precompute(segments: &[Segment], size: u32, max_radius: f32) -> Self {
         let n = (size * size) as usize;
         let outer = max_radius + PIXEL_CENTER;
 
         // Pass 1: count the segments touching each pixel.
         let mut counts = vec![0u32; n];
-        for_each_covered_pixel(track, size, outer, max_radius, |idx, _, _| {
+        for_each_covered_pixel(segments, size, outer, max_radius, |idx, _, _| {
             counts[idx] += 1;
         });
 
@@ -307,13 +210,17 @@ impl TrackRaster {
         // span comes out sorted by segment index for free.
         let mut entries = vec![(0u32, 0.0f32); total as usize];
         let mut cursors = vec![0u32; n];
-        for_each_covered_pixel(track, size, outer, max_radius, |idx, seg, d| {
+        for_each_covered_pixel(segments, size, outer, max_radius, |idx, seg, d| {
             let pos = (offsets[idx] + cursors[idx]) as usize;
             entries[pos] = (seg, d);
             cursors[idx] += 1;
         });
 
-        TrackRaster { entries, offsets }
+        TrackRaster {
+            entries,
+            offsets,
+            spans: segments.iter().map(|s| (s.t0, s.t1)).collect(),
+        }
     }
 }
 
@@ -322,30 +229,21 @@ impl TrackRaster {
 /// Shared by both CSR passes so the counting and filling traversals can never
 /// disagree about which pixels a segment touches.
 fn for_each_covered_pixel(
-    track: &[PixelFrame],
+    segments: &[Segment],
     size: u32,
     outer: f32,
     max_radius: f32,
     mut visit: impl FnMut(usize, u32, f32),
 ) {
-    for seg_idx in 0..track.len().saturating_sub(1) {
-        let (x0, y0) = (track[seg_idx].x, track[seg_idx].y);
-        let (x1, y1) = (track[seg_idx + 1].x, track[seg_idx + 1].y);
-        if !x0.is_finite() || !x1.is_finite() {
+    for (seg_idx, seg) in segments.iter().enumerate() {
+        if !(seg.x0.is_finite() && seg.x1.is_finite()) {
             continue;
         }
-        let (px_min, px_max, py_min, py_max) = segment_pixel_bounds(x0, y0, x1, y1, outer, size);
+        let (px_min, px_max, py_min, py_max) = segment_pixel_bounds(seg, outer, size);
         for py in py_min..=py_max {
             let row = (py * size) as usize;
             for px in px_min..=px_max {
-                let d = dist_to_segment(
-                    px as f32 + PIXEL_CENTER,
-                    py as f32 + PIXEL_CENTER,
-                    x0,
-                    y0,
-                    x1,
-                    y1,
-                );
+                let d = dist_to_segment(px as f32 + PIXEL_CENTER, py as f32 + PIXEL_CENTER, seg);
                 if aa_coverage(d, max_radius) > 0.0 {
                     visit(row + px as usize, seg_idx as u32, d);
                 }
@@ -358,21 +256,21 @@ fn for_each_covered_pixel(
 
 /// Render one frame into `buf` as premultiplied sRGB RGBA.
 ///
-/// `work` is a scratch buffer of `size² × 4` f32s, zeroed on entry: all
-/// compositing happens in linear light before a single conversion at the end.
-/// Segment `s` is behind the vehicle iff `s < frame_idx`.
+/// `work` is a scratch buffer of `size² × 4` f32s: all compositing happens in
+/// linear light before a single conversion at the end.  A segment is behind the
+/// vehicle once the whole of it has been driven, which is what lets the split
+/// move along the track independently of where its vertices fall.
 fn render_frame(
     buf: &mut [u8],
     work: &mut [f32],
     raster: &TrackRaster,
-    frames_px: &[PixelFrame],
+    layout: &TrackLayout,
     frame_idx: usize,
-    size: u32,
-    fade_frames: u32,
+    fps: f32,
 ) {
     work.fill(0.0);
-    let cur_seg = frame_idx as u32;
-    let npx = (size * size) as usize;
+    let now = frame_idx as f32 / fps;
+    let npx = (layout.size * layout.size) as usize;
 
     // Layer 1: the track — future underneath, past on top so the brighter,
     // thicker styling wins wherever the route crosses itself.
@@ -390,10 +288,11 @@ fn render_frame(
         let mut future_cov = 0.0f32;
         let mut past_cov = 0.0f32;
         for &(seg, d) in &raster.entries[start..end] {
-            if seg >= cur_seg {
+            let (t0, t1) = raster.spans[seg as usize];
+            if t0 >= now {
                 let c = aa_coverage(d, TRACK_RADIUS_THIN);
                 future_cov += c * (1.0 - future_cov);
-            } else if cur_seg - seg >= fade_frames {
+            } else if t1 <= now - TRAIL_GAP_SECS {
                 let c = aa_coverage(d, TRACK_RADIUS_THICK);
                 past_cov += c * (1.0 - past_cov);
             }
@@ -407,15 +306,16 @@ fn render_frame(
     }
 
     // Layer 2: the position marker.
-    if let Some(p) = frames_px.get(frame_idx)
-        && p.x.is_finite()
+    if let Some(marker) = layout.frames.get(frame_idx)
+        && marker.x.is_finite()
     {
-        let fill = if p.interpolated {
-            ARROW_STROKE
-        } else {
+        // Gap-filled positions get the neutral arrow colour instead of red.
+        let fill = if marker.source == PositionSource::HardwareFix {
             ARROW_FILL
+        } else {
+            ARROW_STROKE
         };
-        draw_arrow(work, size, p.x, p.y, p.heading, fill);
+        draw_arrow(work, layout.size, marker, fill);
     }
 
     // Final pass: premultiplied linear f32 → premultiplied sRGB u8.
@@ -441,37 +341,30 @@ fn render_frame(
 
 // ── Drawing helpers ───────────────────────────────────────────────────────────
 
-/// Distance from `(px, py)` to the segment `(x0,y0)→(x1,y1)` — the SDF value
-/// anti-aliasing is derived from.
+/// Distance from `(px, py)` to `seg` — the SDF value anti-aliasing is derived
+/// from.
 #[inline]
-fn dist_to_segment(px: f32, py: f32, x0: f32, y0: f32, x1: f32, y1: f32) -> f32 {
-    let dx = x1 - x0;
-    let dy = y1 - y0;
+fn dist_to_segment(px: f32, py: f32, seg: &Segment) -> f32 {
+    let dx = seg.x1 - seg.x0;
+    let dy = seg.y1 - seg.y0;
     let len_sq = dx * dx + dy * dy;
     // A stationary vehicle produces zero-length segments; treat as a point.
     if len_sq < 1e-6 {
-        return ((px - x0).powi(2) + (py - y0).powi(2)).sqrt();
+        return ((px - seg.x0).powi(2) + (py - seg.y0).powi(2)).sqrt();
     }
-    let t = (((px - x0) * dx + (py - y0) * dy) / len_sq).clamp(0.0, 1.0);
-    ((px - (x0 + t * dx)).powi(2) + (py - (y0 + t * dy)).powi(2)).sqrt()
+    let t = (((px - seg.x0) * dx + (py - seg.y0) * dy) / len_sq).clamp(0.0, 1.0);
+    ((px - (seg.x0 + t * dx)).powi(2) + (py - (seg.y0 + t * dy)).powi(2)).sqrt()
 }
 
 /// Pixel bounding box of a segment, grown by `outer` and clamped to the frame.
 #[inline]
-fn segment_pixel_bounds(
-    x0: f32,
-    y0: f32,
-    x1: f32,
-    y1: f32,
-    outer: f32,
-    size: u32,
-) -> (u32, u32, u32, u32) {
+fn segment_pixel_bounds(seg: &Segment, outer: f32, size: u32) -> (u32, u32, u32, u32) {
     let s = (size - 1) as f32;
     (
-        (x0.min(x1) - outer).floor().clamp(0.0, s) as u32,
-        (x0.max(x1) + outer).ceil().clamp(0.0, s) as u32,
-        (y0.min(y1) - outer).floor().clamp(0.0, s) as u32,
-        (y0.max(y1) + outer).ceil().clamp(0.0, s) as u32,
+        (seg.x0.min(seg.x1) - outer).floor().clamp(0.0, s) as u32,
+        (seg.x0.max(seg.x1) + outer).ceil().clamp(0.0, s) as u32,
+        (seg.y0.min(seg.y1) - outer).floor().clamp(0.0, s) as u32,
+        (seg.y0.max(seg.y1) + outer).ceil().clamp(0.0, s) as u32,
     )
 }
 
@@ -510,11 +403,12 @@ fn composite(work: &mut [f32], off: usize, rgb_lin: [f32; 3], alpha: f32) {
 }
 
 /// Draw the anti-aliased position marker: a notched arrowhead pointing along
-/// `heading_deg` (clockwise from north), with a contrasting outline.
-fn draw_arrow(work: &mut [f32], size: u32, cx: f32, cy: f32, heading_deg: f32, fill: ColorLinA) {
+/// the frame's heading (clockwise from north), with a contrasting outline.
+fn draw_arrow(work: &mut [f32], size: u32, marker: &MarkerFrame, fill: ColorLinA) {
+    let (cx, cy) = (marker.x, marker.y);
     // A heading is unavailable while stopped; point north rather than vanish.
-    let theta = if heading_deg.is_finite() {
-        heading_deg.to_radians()
+    let theta = if marker.heading.is_finite() {
+        marker.heading.to_radians()
     } else {
         0.0
     };
@@ -591,49 +485,39 @@ fn edge_dist(p: (f32, f32), a: (f32, f32), b: (f32, f32)) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::gps::PositionSource;
 
-    fn point(lat: f64, lon: f64) -> TrackPoint {
-        TrackPoint {
-            lat,
-            lon,
+    fn segment(x0: f32, y0: f32, x1: f32, y1: f32, t0: f32, t1: f32) -> Segment {
+        Segment {
+            x0,
+            y0,
+            x1,
+            y1,
+            t0,
+            t1,
+        }
+    }
+
+    fn marker(x: f32, y: f32) -> MarkerFrame {
+        MarkerFrame {
+            x,
+            y,
             heading: 90.0,
             source: PositionSource::HardwareFix,
         }
     }
 
-    #[test]
-    fn viewport_centres_the_track_and_keeps_it_inside() {
-        let track = vec![point(25.0, 121.0), point(25.01, 121.02)];
-        let vp = Viewport::fit(&track, 480).unwrap();
-
-        let (x0, y0) = vp.to_pixel(25.0, 121.0);
-        let (x1, y1) = vp.to_pixel(25.01, 121.02);
-        for v in [x0, y0, x1, y1] {
-            assert!((0.0..=480.0).contains(&v), "{v} escaped the frame");
+    /// A horizontal track of `n` one-pixel, one-second segments.
+    fn layout(n: usize, size: u32) -> TrackLayout {
+        TrackLayout {
+            size,
+            segments: (0..n)
+                .map(|i| {
+                    let x = 10.0 + i as f32;
+                    segment(x, 10.0, x + 1.0, 10.0, i as f32, i as f32 + 1.0)
+                })
+                .collect(),
+            frames: (0..n).map(|i| marker(10.0 + i as f32, 10.0)).collect(),
         }
-        // Latitude grows upward on the map but downward in pixels.
-        assert!(y1 < y0);
-        assert!(x1 > x0);
-        // The midpoint lands at the centre of the frame.
-        let (cx, cy) = vp.to_pixel(25.005, 121.01);
-        assert!((cx - 240.0).abs() < 0.5 && (cy - 240.0).abs() < 0.5);
-    }
-
-    #[test]
-    fn a_degenerate_track_still_yields_a_viewport() {
-        // A vehicle parked with the engine running reports one position forever.
-        let track = vec![point(25.0, 121.0), point(25.0, 121.0)];
-        let vp = Viewport::fit(&track, 480).unwrap();
-        let (x, y) = vp.to_pixel(25.0, 121.0);
-        assert!(x.is_finite() && y.is_finite());
-    }
-
-    #[test]
-    fn viewport_needs_at_least_one_position() {
-        let mut p = point(25.0, 121.0);
-        p.source = PositionSource::NoPosition;
-        assert!(Viewport::fit(&[p], 480).is_none());
     }
 
     #[test]
@@ -646,37 +530,88 @@ mod tests {
 
     #[test]
     fn distance_to_a_segment_projects_onto_it_and_clamps_at_the_ends() {
-        assert!((dist_to_segment(5.0, 3.0, 0.0, 0.0, 10.0, 0.0) - 3.0).abs() < 1e-6);
+        let s = segment(0.0, 0.0, 10.0, 0.0, 0.0, 1.0);
+        assert!((dist_to_segment(5.0, 3.0, &s) - 3.0).abs() < 1e-6);
         // Beyond the far end, distance is measured to the endpoint itself.
-        assert!((dist_to_segment(14.0, 0.0, 0.0, 0.0, 10.0, 0.0) - 4.0).abs() < 1e-6);
-        assert!((dist_to_segment(0.0, 5.0, 2.0, 2.0, 2.0, 2.0) - 3.605551).abs() < 1e-5);
+        assert!((dist_to_segment(14.0, 0.0, &s) - 4.0).abs() < 1e-6);
+        // A stationary vehicle: the segment collapses to a point.
+        let dot = segment(2.0, 2.0, 2.0, 2.0, 0.0, 1.0);
+        assert!((dist_to_segment(0.0, 5.0, &dot) - 3.605551).abs() < 1e-5);
     }
 
     #[test]
-    fn the_raster_covers_the_line_between_two_points_only() {
-        let frames = vec![
-            PixelFrame {
-                x: 10.0,
-                y: 10.0,
-                heading: 90.0,
-                interpolated: false,
-            },
-            PixelFrame {
-                x: 30.0,
-                y: 10.0,
-                heading: 90.0,
-                interpolated: false,
-            },
-        ];
-        let size = 48;
-        let raster = TrackRaster::precompute(&frames, size, TRACK_RADIUS_THICK);
+    fn the_raster_covers_the_line_and_nothing_else() {
+        let l = layout(20, 48);
+        let raster = TrackRaster::precompute(&l.segments, l.size, TRACK_RADIUS_THICK);
 
         let covered = |x: u32, y: u32| {
-            let i = (y * size + x) as usize;
+            let i = (y * l.size + x) as usize;
             raster.offsets[i + 1] > raster.offsets[i]
         };
-        assert!(covered(20, 10), "midpoint of the segment must be covered");
-        assert!(!covered(20, 40), "far from the segment must be empty");
-        assert_eq!(raster.offsets.len(), (size * size + 1) as usize);
+        assert!(covered(20, 10), "the middle of the track must be covered");
+        assert!(!covered(20, 40), "far from the track must be empty");
+        assert_eq!(raster.offsets.len(), (l.size * l.size + 1) as usize);
+    }
+
+    /// Alpha the track layer alone writes at one pixel, in frame `frame_idx`.
+    fn track_alpha(l: &TrackLayout, x: u32, y: u32, frame_idx: usize, fps: f32) -> f32 {
+        // No marker frames: the arrow must not be measured with the track.
+        let bare = TrackLayout {
+            size: l.size,
+            segments: l.segments.clone(),
+            frames: Vec::new(),
+        };
+        let npx = (l.size * l.size) as usize;
+        let raster = TrackRaster::precompute(&bare.segments, bare.size, TRACK_RADIUS_THICK);
+        let mut work = vec![0.0f32; npx * 4];
+        let mut buf = vec![0u8; npx * 4];
+        render_frame(&mut buf, &mut work, &raster, &bare, frame_idx, fps);
+        work[((y * l.size + x) as usize) * 4 + 3]
+    }
+
+    #[test]
+    fn the_split_between_driven_and_ahead_follows_the_clock() {
+        // A minute of driving, one pixel a second, with the vehicle at x = 40
+        // after 30 s.
+        let l = layout(60, 96);
+        let behind = track_alpha(&l, 20, 10, 30, 1.0);
+        let ahead = track_alpha(&l, 60, 10, 30, 1.0);
+        assert!(behind > ahead, "driven {behind} vs ahead {ahead}");
+        assert!((behind - TRACK_PAST.alpha).abs() < 1e-3, "{behind}");
+        assert!((ahead - TRACK_FUTURE.alpha).abs() < 1e-3, "{ahead}");
+
+        // Earlier in the drive that first pixel has not been reached yet.
+        let earlier = track_alpha(&l, 20, 10, 5, 1.0);
+        assert!((earlier - TRACK_FUTURE.alpha).abs() < 1e-3, "{earlier}");
+    }
+
+    #[test]
+    fn crossings_do_not_pile_up_opacity() {
+        // Two passes over the same stretch of road, an hour apart.
+        let mut l = layout(4, 48);
+        l.segments.extend(
+            (0..4).map(|i| segment(10.0 + i as f32, 10.0, 11.0 + i as f32, 10.0, 3600.0, 3601.0)),
+        );
+        // Both passes are behind the vehicle, yet the pixel stays at one layer.
+        let a = track_alpha(&l, 12, 10, 4000, 1.0);
+        assert!((a - TRACK_PAST.alpha).abs() < 1e-3, "{a}");
+    }
+
+    #[test]
+    fn the_marker_is_drawn_over_the_track() {
+        let l = layout(20, 48);
+        let raster = TrackRaster::precompute(&l.segments, l.size, TRACK_RADIUS_THICK);
+        let npx = (l.size * l.size) as usize;
+        let mut work = vec![0.0f32; npx * 4];
+        let mut buf = vec![0u8; npx * 4];
+        render_frame(&mut buf, &mut work, &raster, &l, 10, 1.0);
+
+        // The arrow sits on the marker: opaque, and red rather than white.
+        let px = ((10 * l.size + 20) as usize) * 4;
+        assert!((work[px + 3] - 1.0).abs() < 1e-3, "alpha {}", work[px + 3]);
+        assert!(work[px] > work[px + 1], "the arrow should be red");
+        // …and the frame is emitted premultiplied, transparent where untouched.
+        assert_eq!(&buf[0..4], &[0, 0, 0, 0]);
+        assert_eq!(buf[px + 3], 255);
     }
 }
