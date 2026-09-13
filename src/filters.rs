@@ -49,9 +49,9 @@ pub fn wrap_pi(v: f64) -> f64 {
 /// output = previous_output + delta
 /// ```
 ///
-/// A NaN input holds the accumulator, which is what a stopped vehicle needs:
-/// the receiver's course is meaningless below walking pace, so those samples
-/// arrive as NaN and the last real heading is carried across them.
+/// A NaN input holds the accumulator, which is what a record that carried no
+/// course needs: the last real heading is carried across it rather than the
+/// series collapsing to north.
 pub fn unwrap_deg(values: &[f64]) -> Vec<f64> {
     let mut acc = 0.0f64;
     let mut out = Vec::with_capacity(values.len());
@@ -179,6 +179,9 @@ pub struct QuickInterpolator<'a> {
     values: &'a [f64],
     cursor: usize,
     max_gap: f64,
+    /// `false` is the filter's sample-and-hold mode (field `0x68`): the value
+    /// of the preceding sample rather than a blend of the bracketing pair.
+    interpolate: bool,
 }
 
 impl<'a> QuickInterpolator<'a> {
@@ -189,11 +192,19 @@ impl<'a> QuickInterpolator<'a> {
             values,
             cursor: 0,
             max_gap: f64::INFINITY,
+            interpolate: true,
         }
     }
 
     pub fn with_max_gap(mut self, max_gap: f64) -> Self {
         self.max_gap = max_gap;
+        self
+    }
+
+    /// Sample and hold instead of blending — what a value that is not a
+    /// quantity needs, a flag being the obvious case.
+    pub fn hold(mut self) -> Self {
+        self.interpolate = false;
         self
     }
 
@@ -219,6 +230,9 @@ impl<'a> QuickInterpolator<'a> {
             return f64::NAN;
         }
         let (v0, v1) = (self.values[lo], self.values[lo + 1]);
+        if !self.interpolate {
+            return v0;
+        }
         let t = if x1 == x0 {
             0.0
         } else {
@@ -303,5 +317,19 @@ mod tests {
         let mut gapped = QuickInterpolator::new(&x, &v).with_max_gap(1.5);
         assert!((gapped.value_at(0.5) - 5.0).abs() < 1e-9);
         assert!(gapped.value_at(2.0).is_nan());
+    }
+
+    #[test]
+    fn holding_returns_the_preceding_sample() {
+        let x = [0.0, 1.0, 3.0];
+        let v = [0.0, f64::NAN, 30.0];
+        let mut h = QuickInterpolator::new(&x, &v).hold();
+        assert_eq!(h.value_at(0.9), 0.0);
+        // A hole starts at its own sample and runs up to the next one.
+        assert!(h.value_at(1.0).is_nan());
+        assert!(h.value_at(2.9).is_nan());
+        // The very last sample still holds its predecessor: there is no pair
+        // beyond it to step into. The original behaves the same way.
+        assert!(h.value_at(3.0).is_nan());
     }
 }

@@ -33,11 +33,6 @@ const MIN_SPACING: f64 = 1e-3;
 /// [`PositionSource::Interpolated`] rather than a hardware fix.
 const FIX_MAX_AGE: f64 = 1.5;
 
-/// Heading is meaningless when the vehicle is crawling: the receiver's reported
-/// course jitters wildly below this speed, so those records carry no bearing at
-/// all and the last real heading is held instead.
-const MIN_HEADING_SPEED: f64 = 5.0 / 3.6;
-
 /// Mean Earth radius (IUGG), for the along-track distance channel.
 const EARTH_RADIUS_M: f64 = 6_371_008.8;
 
@@ -66,8 +61,8 @@ pub struct Fix {
     pub lon: f64,
     /// Ground speed, m/s.
     pub speed: f64,
-    /// Course over ground in degrees true; `NaN` when the vehicle is too slow
-    /// for the receiver's course to mean anything.
+    /// Course over ground in degrees true, exactly as the receiver reported it;
+    /// `NaN` on a record that carried no course at all.
     pub bearing: f64,
     /// Distance travelled since the first fix, metres.  This is what the trace
     /// decimation thins by.
@@ -166,11 +161,7 @@ fn fix_from(t: f64, r: &nmea::Rmc) -> Option<Fix> {
         lat: r.lat,
         lon: r.lon,
         speed,
-        bearing: if speed >= MIN_HEADING_SPEED {
-            r.track
-        } else {
-            f64::NAN
-        },
+        bearing: r.track,
         dist: 0.0,
     })
 }
@@ -255,17 +246,17 @@ mod tests {
     }
 
     #[test]
-    fn speed_becomes_metres_per_second_and_gates_the_heading() {
+    fn speed_becomes_metres_per_second_and_the_course_is_passed_through() {
         let f = fix_from(1.0, &record(true, 72.0, 330.0)).unwrap();
         assert!((f.speed - 20.0).abs() < 1e-9);
         assert!((f.bearing - 330.0).abs() < 1e-9);
 
-        // Crawling: the course is noise, so the fix carries no bearing.
+        // The receiver decides what a crawling vehicle's course is, not us.
         let slow = fix_from(1.0, &record(true, 0.9, 12.0)).unwrap();
-        assert!(slow.bearing.is_nan());
-        // A receiver that reports no speed at all must not report a heading.
+        assert!((slow.bearing - 12.0).abs() < 1e-9);
+        // A record that carried no course at all still carries none.
         assert!(
-            fix_from(1.0, &record(true, f64::NAN, 12.0))
+            fix_from(1.0, &record(true, 0.9, f64::NAN))
                 .unwrap()
                 .bearing
                 .is_nan()

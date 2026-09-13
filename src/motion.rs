@@ -45,6 +45,12 @@ pub struct MotionSeries {
     /// Bearing in degrees, unwrapped into a continuous series — it may run past
     /// 360 or below 0, and is wrapped back only where it is displayed.
     pub bearing: Vec<f64>,
+    /// The course exactly as the receiver reported it, NaN where it was not
+    /// usable.  `unwrap()` deliberately holds the last heading across those
+    /// holes, which is what the acceleration channels want but hides the fact
+    /// that the vehicle has no heading at all; this keeps the holes, purely as
+    /// a mask for [`MotionPlayer`].
+    bearing_raw: Vec<f64>,
     /// Lateral acceleration, m/s²; negative in a left-hand corner.
     pub lateral_acc: Vec<f64>,
     /// Longitudinal acceleration, m/s²; negative under braking.
@@ -72,6 +78,7 @@ impl MotionSeries {
             raw_bearing.push(f.bearing);
         }
         m.bearing = filters::unwrap_deg(&raw_bearing);
+        m.bearing_raw = raw_bearing;
 
         // gpsLatAcc / gpsLongAcc are two-sample filters: index i uses i-1 and i.
         let mut lat_acc = vec![f64::NAN; n];
@@ -103,6 +110,12 @@ impl MotionSeries {
             lat: QuickInterpolator::new(&self.t, &self.lat).with_max_gap(max_gap_s),
             lon: QuickInterpolator::new(&self.t, &self.lon).with_max_gap(max_gap_s),
             bearing: QuickInterpolator::new(&self.t, &self.bearing).with_max_gap(max_gap_s),
+            // A flag is not a quantity: held, not blended, so the marker loses
+            // its heading on the record that lost it and gets it back on the
+            // record that brought it back.
+            bearing_known: QuickInterpolator::new(&self.t, &self.bearing_raw)
+                .with_max_gap(max_gap_s)
+                .hold(),
         }
     }
 }
@@ -128,6 +141,7 @@ pub struct MotionPlayer<'a> {
     lat: QuickInterpolator<'a>,
     lon: QuickInterpolator<'a>,
     bearing: QuickInterpolator<'a>,
+    bearing_known: QuickInterpolator<'a>,
 }
 
 /// One interpolated playback sample.
@@ -135,8 +149,10 @@ pub struct MotionPlayer<'a> {
 pub struct MotionState {
     pub lat: f64,
     pub lon: f64,
-    /// Degrees, still unwrapped; NaN while the course is unusable.
-    pub bearing: f64,
+    /// Degrees, still unwrapped, or `None` where the vehicle has no heading —
+    /// the same distinction `ex1` makes when it draws a circle instead of an
+    /// arrow, except that here it survives playback.
+    pub bearing: Option<f64>,
 }
 
 impl MotionState {
@@ -149,10 +165,11 @@ impl MotionState {
 impl MotionPlayer<'_> {
     /// Sampling in increasing `t` keeps every lookup O(1).
     pub fn state_at(&mut self, t: f64) -> MotionState {
+        let known = !self.bearing_known.value_at(t).is_nan();
         MotionState {
             lat: self.lat.value_at(t),
             lon: self.lon.value_at(t),
-            bearing: self.bearing.value_at(t),
+            bearing: known.then(|| self.bearing.value_at(t)),
         }
     }
 }
@@ -237,6 +254,32 @@ mod tests {
         // 350 -> 10 is +20 degrees, not -340.
         assert!((m.bearing[1] - 370.0).abs() < 1e-9, "{:?}", m.bearing);
         let mut p = m.player(10.0);
-        assert!((p.state_at(0.5).bearing.rem_euclid(360.0) - 0.0).abs() < 1e-9);
+        let b = p.state_at(0.5).bearing.unwrap();
+        assert!((b.rem_euclid(360.0) - 0.0).abs() < 1e-9, "b = {b}");
+    }
+
+    #[test]
+    fn a_vehicle_with_no_course_reports_no_heading() {
+        // Rolling, then stopped at a light with the receiver dropping the
+        // course field, then away again.
+        let fixes = vec![
+            fix(0.0, 25.0, 121.0, 10.0, 90.0),
+            fix(1.0, 25.001, 121.0, 10.0, 92.0),
+            fix(2.0, 25.002, 121.0, 0.2, f64::NAN),
+            fix(3.0, 25.002, 121.0, 0.0, f64::NAN),
+            fix(4.0, 25.002, 121.0, 10.0, 95.0),
+            fix(5.0, 25.003, 121.0, 10.0, 95.0),
+        ];
+        let m = MotionSeries::from_fixes(&fixes);
+        // unwrap() still holds the last heading, which is what gpsLatAcc wants.
+        assert!((m.bearing[3] - 92.0).abs() < 1e-9, "{:?}", m.bearing);
+
+        let mut p = m.player(10.0);
+        assert!(p.state_at(1.5).bearing.is_some());
+        // Held, not blended: the heading goes on the record that lost it...
+        assert!(p.state_at(2.0).bearing.is_none());
+        assert!(p.state_at(3.9).bearing.is_none());
+        // ...and comes back on the record that brought it back.
+        assert_eq!(p.state_at(4.0).bearing, Some(95.0));
     }
 }

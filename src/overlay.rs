@@ -45,8 +45,12 @@ const ARROW_BACK: f32 = 6.0;
 const ARROW_NOTCH_BACK: f32 = 3.0;
 /// Half-width of the arrow base.
 const ARROW_HALF_BASE: f32 = 7.0;
-/// Outline drawn around the arrow so it stays readable over a bright road.
+/// Outline drawn around the marker so it stays readable over a bright road.
 const ARROW_OUTLINE: f32 = 2.0;
+/// Radius of the dot that stands in for the arrow when there is no heading —
+/// roughly the arrow's visual weight, as `ex1`'s 5 dp circle is to its 9 dp
+/// arrow.
+const DOT_RADIUS: f32 = 5.0;
 
 /// Pixel (px, py) is sampled at its centre, following the usual
 /// half-open-interval convention where pixel i covers [i, i+1).
@@ -315,7 +319,11 @@ fn render_frame(
         } else {
             ARROW_STROKE
         };
-        draw_arrow(work, layout.size, marker, fill);
+        if marker.heading.is_finite() {
+            draw_arrow(work, layout.size, marker, fill);
+        } else {
+            draw_dot(work, layout.size, marker, fill);
+        }
     }
 
     // Final pass: premultiplied linear f32 → premultiplied sRGB u8.
@@ -404,14 +412,12 @@ fn composite(work: &mut [f32], off: usize, rgb_lin: [f32; 3], alpha: f32) {
 
 /// Draw the anti-aliased position marker: a notched arrowhead pointing along
 /// the frame's heading (clockwise from north), with a contrasting outline.
+///
+/// The caller guarantees the heading is known; without one there is no
+/// direction to point at and [`draw_dot`] is drawn instead.
 fn draw_arrow(work: &mut [f32], size: u32, marker: &MarkerFrame, fill: ColorLinA) {
     let (cx, cy) = (marker.x, marker.y);
-    // A heading is unavailable while stopped; point north rather than vanish.
-    let theta = if marker.heading.is_finite() {
-        marker.heading.to_radians()
-    } else {
-        0.0
-    };
+    let theta = marker.heading.to_radians();
     // Forward unit vector in screen space (y grows downward, so north is −y).
     let (fx, fy) = (theta.sin(), -theta.cos());
     // Screen-right perpendicular.
@@ -462,6 +468,47 @@ fn draw_arrow(work: &mut [f32], size: u32, marker: &MarkerFrame, fill: ColorLinA
                 );
             }
             let cov_fill = smoothstep(-0.5, 0.5, sdf);
+            if cov_fill > 0.0 {
+                composite(work, idx, fill.rgb, cov_fill * fill.alpha);
+            }
+        }
+    }
+}
+
+/// Draw the marker for a frame with no heading: a plain dot, carrying the same
+/// fill and outline as the arrow.
+///
+/// This is `ex1.mo243k()`'s other branch — RaceChrono draws a circle whenever
+/// the bearing channel has no value — and it is what a record that carried no
+/// course gets.  Pointing an arrow north, or leaving it aimed wherever the
+/// vehicle last moved, would both be claims the data does not make.
+fn draw_dot(work: &mut [f32], size: u32, marker: &MarkerFrame, fill: ColorLinA) {
+    let (cx, cy) = (marker.x, marker.y);
+    let outer = DOT_RADIUS + ARROW_OUTLINE;
+    let margin = outer + 1.0;
+    let s = (size - 1) as f32;
+    let px_min = (cx - margin).clamp(0.0, s) as u32;
+    let px_max = (cx + margin).clamp(0.0, s) as u32;
+    let py_min = (cy - margin).clamp(0.0, s) as u32;
+    let py_max = (cy + margin).clamp(0.0, s) as u32;
+
+    for py in py_min..=py_max {
+        for px in px_min..=px_max {
+            let dx = px as f32 + PIXEL_CENTER - cx;
+            let dy = py as f32 + PIXEL_CENTER - cy;
+            let d = (dx * dx + dy * dy).sqrt();
+
+            let idx = ((py * size + px) * 4) as usize;
+            let cov_outline = aa_coverage(d, outer);
+            if cov_outline > 0.0 {
+                composite(
+                    work,
+                    idx,
+                    ARROW_STROKE.rgb,
+                    cov_outline * ARROW_STROKE.alpha,
+                );
+            }
+            let cov_fill = aa_coverage(d, DOT_RADIUS);
             if cov_fill > 0.0 {
                 composite(work, idx, fill.rgb, cov_fill * fill.alpha);
             }
@@ -613,5 +660,53 @@ mod tests {
         // …and the frame is emitted premultiplied, transparent where untouched.
         assert_eq!(&buf[0..4], &[0, 0, 0, 0]);
         assert_eq!(buf[px + 3], 255);
+    }
+
+    /// Render frame 10 with the marker parked at (20, 30), clear of the track,
+    /// and hand back the linear-light buffer.
+    fn render_marker(size: u32, heading: f32) -> Vec<f32> {
+        let mut l = layout(20, size);
+        l.frames[10] = MarkerFrame {
+            x: 20.0,
+            y: 30.0,
+            heading,
+            source: PositionSource::HardwareFix,
+        };
+        let raster = TrackRaster::precompute(&l.segments, size, TRACK_RADIUS_THICK);
+        let npx = (size * size) as usize;
+        let mut work = vec![0.0f32; npx * 4];
+        let mut buf = vec![0u8; npx * 4];
+        render_frame(&mut buf, &mut work, &raster, &l, 10, 1.0);
+        work
+    }
+
+    #[test]
+    fn a_frame_with_no_heading_gets_a_dot_instead_of_an_arrow() {
+        const SIZE: u32 = 48;
+        let alpha = |w: &Vec<f32>, x: u32, y: u32| w[((y * SIZE + x) as usize) * 4 + 3];
+
+        let arrow = render_marker(SIZE, 90.0); // pointing east
+        let dot = render_marker(SIZE, f32::NAN);
+
+        // Both mark the position itself, opaque and red.
+        for w in [&arrow, &dot] {
+            let px = ((30 * SIZE + 20) as usize) * 4;
+            assert!((w[px + 3] - 1.0).abs() < 1e-3, "alpha {}", w[px + 3]);
+            assert!(w[px] > w[px + 1], "the marker should be red");
+        }
+
+        // The arrow reaches ahead of the position; the dot claims no direction.
+        assert!(alpha(&arrow, 29, 30) > 0.9, "{}", alpha(&arrow, 29, 30));
+        assert!(alpha(&dot, 29, 30) < 0.01, "{}", alpha(&dot, 29, 30));
+
+        // It is round and bounded: covered 6 px out in every direction, gone at 9.
+        for (dx, dy) in [(6i32, 0i32), (-6, 0), (0, 6), (0, -6)] {
+            let a = alpha(&dot, (20 + dx) as u32, (30 + dy) as u32);
+            assert!(a > 0.9, "dot missing at {dx},{dy}: {a}");
+        }
+        for (dx, dy) in [(9i32, 0i32), (-9, 0), (0, 9), (0, -9)] {
+            let a = alpha(&dot, (20 + dx) as u32, (30 + dy) as u32);
+            assert!(a < 0.01, "dot spills to {dx},{dy}: {a}");
+        }
     }
 }

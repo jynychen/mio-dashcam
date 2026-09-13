@@ -214,8 +214,11 @@ fn markers(
                 x: view.project_x(state.lon),
                 y: view.project_y(state.lat),
                 // The series keeps the heading unwrapped; the arrow wants it
-                // back in [0, 360).
-                heading: state.bearing.rem_euclid(360.0) as f32,
+                // back in [0, 360). No heading stays NaN, and the renderer
+                // draws a dot rather than an arrow pointing at a guess.
+                heading: state
+                    .bearing
+                    .map_or(f32::NAN, |b| b.rem_euclid(360.0) as f32),
                 source: if session.has_fix_at(t) {
                     PositionSource::HardwareFix
                 } else {
