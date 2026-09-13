@@ -320,7 +320,9 @@ fn render_group(group: &Group, opts: &RenderOptions, interrupted: &AtomicBool) -
 
 /// Parse the session's NMEA logs and render the track overlay.
 ///
-/// Returns `Ok(None)` when the drive holds too little GPS data to draw.
+/// Returns `Ok(None)` when the session does not contain enough usable fixes to
+/// build a viewable polyline and marker path; the function still reports the
+/// parsed session statistics in the console output.
 fn render_overlay(
     group: &Group,
     opts: &RenderOptions,

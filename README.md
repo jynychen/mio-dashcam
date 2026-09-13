@@ -1,7 +1,7 @@
 # mio-dashcam
 
 Mio 行車記錄器的檔案整理與轉檔工具。把記憶卡上散落的三分鐘片段，還原成一趟行程一支影片：
-後鏡頭疊在前鏡頭上方（PIP）、右上角畫出這趟路的 GPS 軌跡、音量正規化。
+後鏡頭疊在前鏡頭上方（PIP）、右上角畫出這趟路的 GPS 軌跡 (Overlay)、音量正規化
 
 ## Requirements
 
@@ -16,22 +16,22 @@ cargo build --release      # → target/release/mio-dashcam
 
 ```sh
 # 1. 整理記憶卡：Normal/ 與 Event/ 攤平成每日一個資料夾
-mio-dashcam organize /Volumes/DASHCAM ~/Movies/2026行車器錄器
+mio-dashcam organize /Volumes/DASHCAM ~/Movies/DASHCAM
 mio-dashcam organize -n /Volumes/DASHCAM        # 先看看會做什麼，不動檔案
 mio-dashcam organize --copy /Volumes/DASHCAM .  # 複製而非搬移
 
 # 2. 看看有哪些連續段落（不會動到任何檔案）
-mio-dashcam list ~/Movies/2026行車器錄器
+mio-dashcam list ~/Movies/DASHCAM
 
 # 3. 轉檔
-mio-dashcam render ~/Movies/2026行車器錄器 -o ~/Movies/out
-mio-dashcam render ~/Movies/2026行車器錄器/20260820 -o out -y --skip-existing
+mio-dashcam render ~/Movies/DASHCAM -o ~/Movies/out
+mio-dashcam render ~/Movies/DASHCAM/20260820 -o out -y --skip-existing
 
 # 只轉其中幾段（序號就是 list 印出來的那個）
-mio-dashcam render ~/Movies/2026行車器錄器 -s 12
-mio-dashcam render ~/Movies/2026行車器錄器 -s 2,17-18
-mio-dashcam render ~/Movies/2026行車器錄器 -s 20260911        # 整天
-mio-dashcam render ~/Movies/2026行車器錄器 -s 20260905_235044 # 指名某一段
+mio-dashcam render ~/Movies/DASHCAM -s 12
+mio-dashcam render ~/Movies/DASHCAM -s 2,17-18
+mio-dashcam render ~/Movies/DASHCAM -s 20260911        # 整天
+mio-dashcam render ~/Movies/DASHCAM -s 20260905_235044 # 指名某一段
 ```
 
 `-s/--select` 的每個項目：4 位數以內的數字是**序號**（`3`、`2-5`），其他都當成**名稱前綴**
@@ -69,6 +69,8 @@ Ctrl-C 不會中途砍掉 ffmpeg，而是等目前這支跑完再停，輸出不
 
 ## How it works
 
+以 dashcam clip/NMEA 為來源、以影片 timeline 為主軸、以每 frame transparent video overlay 為輸出的 GPS renderer
+
 **檔名即索引。** `FILE260820-205705F.mp4`、`…R.mp4`、`…F.NMEA` 三個檔靠同一個時間戳配對，
 所以前後鏡頭與 GPS 記錄不管放在哪個子資料夾都能湊回同一段。事件檔 `EMER…` 在整理時
 改名成 `FILE…`，讓它和一般片段一起排序。
@@ -81,13 +83,12 @@ Ctrl-C 不會中途砍掉 ffmpeg，而是等目前這支跑完再停，輸出不
 第一筆，所以每段的第一筆並不對齊 0 秒。做法是：用「檔名時間 − 首筆 UTC」四捨五入到 15 分鐘
 推出時區（可用 `--tz` 指定），再把每筆紀錄放到「前面各段片長總和 + 段內偏移」的位置上。
 
-**1 Hz → 30 fps。** 插值照 RaceChrono 的作法（從 `rc_map_overlay` 移植 `interpolate()`）：
-航向先 unwrap 成連續角度再線性插值，所以箭頭滑順移動而不是每秒跳一格。空洞超過 10 秒
+**1 Hz → 30 fps。** 航向先 unwrap 成連續角度再線性插值，所以箭頭滑順移動而不是每秒跳一格。空洞超過 10 秒
 不硬接 —— 軌跡在那裡斷開、箭頭也不畫，免得畫出一條沒人開過的直線；10 秒內的才補，
 補出來的點用白色箭頭、1.5 秒內有真實定位的用紅色箭頭區分。
 
-**軌跡與運動量。** 投影是球面 Mercator（RaceChrono `h91` 的移植），整趟先框一個 bounding
-box 定住視角，地圖才不會在車底下漂。畫之前照 map gauge 的條件抽點（距上一點要同時滿足
+**軌跡與運動量。** 投影是球面 Mercator，整趟先框一個 bounding box 定住視角，地圖才不會在車底下漂。
+畫之前抽點（距上一點要同時滿足
 ≥0.2 秒與 ≥3 公尺），等紅燈原地抖動的上百筆會塌成兩點。另外由位置／速度／航向導出橫向
 與縱向加速度（`gpsLatAcc`／`gpsLongAcc` 各套 1.2 秒平均），渲染前印出整趟的最高速與峰值。
 

@@ -73,6 +73,8 @@ impl NameInfo {
     }
 }
 
+/// Parse a supported Mio file name, returning `None` for other names or an
+/// invalid calendar/time value.
 pub fn parse(filename: &str) -> Option<NameInfo> {
     let caps = NAME_RE.captures(filename)?;
     let date_raw = caps[2].to_string();

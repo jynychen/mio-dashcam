@@ -48,8 +48,7 @@ const ARROW_HALF_BASE: f32 = 7.0;
 /// Outline drawn around the marker so it stays readable over a bright road.
 const ARROW_OUTLINE: f32 = 2.0;
 /// Radius of the dot that stands in for the arrow when there is no heading —
-/// roughly the arrow's visual weight, as `ex1`'s 5 dp circle is to its 9 dp
-/// arrow.
+/// roughly the arrow's visual weight.
 const DOT_RADIUS: f32 = 5.0;
 
 /// Pixel (px, py) is sampled at its centre, following the usual
@@ -478,10 +477,8 @@ fn draw_arrow(work: &mut [f32], size: u32, marker: &MarkerFrame, fill: ColorLinA
 /// Draw the marker for a frame with no heading: a plain dot, carrying the same
 /// fill and outline as the arrow.
 ///
-/// This is `ex1.mo243k()`'s other branch — RaceChrono draws a circle whenever
-/// the bearing channel has no value — and it is what a record that carried no
-/// course gets.  Pointing an arrow north, or leaving it aimed wherever the
-/// vehicle last moved, would both be claims the data does not make.
+/// A missing heading is rendered as a dot instead of assigning a direction
+/// that is not present in the data.
 fn draw_dot(work: &mut [f32], size: u32, marker: &MarkerFrame, fill: ColorLinA) {
     let (cx, cy) = (marker.x, marker.y);
     let outer = DOT_RADIUS + ARROW_OUTLINE;

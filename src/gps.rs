@@ -9,11 +9,9 @@
 //! first record, so this offset is genuinely non-zero and cannot be replaced by
 //! a record index.
 //!
-//! What comes out is the dashcam's answer to a RaceChrono GPS device: a [`Fix`]
-//! per second, carrying the same channels (position, distance, speed, bearing)
-//! that [`crate::motion`] derives the rest from.  Upsampling 1 Hz to the video's
-//! frame rate used to happen here with cubic splines and now belongs to
-//! [`crate::motion`], which does it the way RaceChrono does.
+//! The result is a [`Fix`] per input record, carrying position, distance, speed,
+//! and bearing.  Frame-rate sampling and derived motion channels belong to
+//! [`crate::motion`].
 
 use anyhow::Result;
 use chrono::{Duration, FixedOffset, NaiveDateTime};
@@ -29,7 +27,7 @@ const CLIP_SLACK: f64 = 3.0;
 /// Two records closer together than this are treated as the same instant.
 const MIN_SPACING: f64 = 1e-3;
 
-/// A frame further than this from the nearest record is reported as
+/// A frame more than this after the preceding record is reported as
 /// [`PositionSource::Interpolated`] rather than a hardware fix.
 const FIX_MAX_AGE: f64 = 1.5;
 
@@ -48,10 +46,8 @@ pub enum PositionSource {
     NoPosition,
 }
 
-/// One receiver fix, placed on the session timeline.
-///
-/// The fields mirror the GPS channels RaceChrono records for a session, in SI
-/// units rather than its fixed-point ones.
+/// One receiver fix, placed on the session timeline and expressed in SI units
+/// where applicable.
 #[derive(Debug, Clone, Copy)]
 pub struct Fix {
     /// Seconds from the start of the concatenated session.
@@ -80,7 +76,7 @@ pub struct Session {
 }
 
 impl Session {
-    /// Whether `t` stands on a real receiver fix rather than between two.
+    /// Whether `t` is within [`FIX_MAX_AGE`] seconds after a recorded fix.
     pub fn has_fix_at(&self, t: f64) -> bool {
         // Records are a second apart, so the preceding one is what the frame is
         // standing on.

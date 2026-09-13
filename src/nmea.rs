@@ -49,9 +49,9 @@ pub struct Rmc {
 
 /// Parse every RMC sentence in `path`, in file order.
 ///
-/// Malformed or checksum-failing lines are skipped: a dashcam log is written
-/// live to an SD card and the tail of a file is routinely truncated mid-line
-/// when power is cut.
+/// Individual malformed or checksum-failing lines are ignored. If a read of the
+/// file itself fails mid-stream, the function stops at the point of failure and
+/// keeps the records that were already parsed successfully.
 pub fn parse_file(path: &Path) -> Result<Vec<Rmc>> {
     let file = File::open(path).with_context(|| format!("cannot open {}", path.display()))?;
     let mut out = Vec::new();

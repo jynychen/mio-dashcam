@@ -48,6 +48,7 @@ pub struct Group {
 }
 
 impl Group {
+    /// Start time of the first clip in the group.
     pub fn start(&self) -> NaiveDateTime {
         self.clips[0].start
     }
@@ -63,12 +64,14 @@ impl Group {
         self.start().format("%Y%m%d_%H%M%S").to_string()
     }
 
+    /// Paths to all front-camera clips, in chronological order.
     pub fn front_paths(&self) -> Vec<&Path> {
         self.clips.iter().map(|c| c.front.as_path()).collect()
     }
 
-    /// Rear paths, or `None` when any segment is missing its rear clip — a
-    /// partial rear track cannot be concatenated in sync with the front one.
+    /// Rear-camera paths for the whole session, or `None` if any segment is
+    /// missing its rear clip. A partial rear track cannot be concatenated in
+    /// sync with the front camera, so the result is rejected as a whole.
     pub fn rear_paths(&self) -> Option<Vec<&Path>> {
         self.clips
             .iter()
@@ -76,6 +79,7 @@ impl Group {
             .collect::<Option<Vec<_>>>()
     }
 
+    /// Whether at least one clip in the group has an NMEA sidecar.
     pub fn has_nmea(&self) -> bool {
         self.clips.iter().any(|c| c.nmea.is_some())
     }
@@ -203,9 +207,9 @@ pub fn scan(root: &Path) -> Result<Vec<Clip>> {
 /// Split time-ordered clips into continuous recording sessions.
 ///
 /// Two consecutive clips belong together when the second one starts no later
-/// than `tolerance` seconds after the first one ends.  Using the probed
-/// duration rather than a fixed nominal length keeps short trailing segments
-/// (and any future change of the camera's segment length) working.
+/// than `tolerance` seconds after the first clip's probed end time. Using the
+/// actual duration from ffprobe keeps short trailing segments and future camera
+/// changes working without a hard-coded nominal length.
 pub fn group(mut clips: Vec<Clip>, tolerance: f64) -> Vec<Group> {
     clips.sort_by_key(|c| c.start);
 

@@ -1,16 +1,9 @@
 //! Spherical Mercator projection and the fit-to-rect viewport built on it.
 //!
-//! Ported from `rc_map_overlay/src/mercator.rs`, itself a port of RaceChrono
-//! 10.2.4's `p000/h91.java` — one class used in two roles, which stay split
-//! here as well:
+//! The projection is used in two roles:
 //!
-//! * geographic bounding box  -> [`GeoBounds`]    (`h91(double,double)`, `m4448n`)
-//! * projection viewport      -> [`MercatorView`] (`h91(int)`, `m4435a`, `m4441f`,
-//!   `m4442g`, `m4445k`)
-//!
-//! The original works in RaceChrono's on-disk fixed-point unit (degrees × 6e6)
-//! and converts to radians with a magic divisor; an NMEA log gives plain
-//! degrees, so those conversions collapse into [`f64::to_radians`].
+//! * geographic bounding box -> [`GeoBounds`]
+//! * projection viewport -> [`MercatorView`]
 //!
 //! This replaces the hand-rolled equirectangular projection the overlay used to
 //! carry.  Mercator is conformal, so a junction drawn at a right angle really
@@ -20,10 +13,7 @@
 
 use std::f64::consts::PI;
 
-/// Zoom ceiling from the map gauge's `m4445k(bounds, 9dp, w, h, 0.0, 262144.0)`
-/// call.  It only ever bites on a degenerate bounding box — a car parked with
-/// the engine running reports one position forever, and fitting a zero-sized
-/// box would otherwise ask for an infinite scale.
+/// Zoom ceiling used for degenerate bounding boxes.
 const MAX_ZOOM: f64 = 262_144.0;
 
 /// Geographic bounding box, in degrees.
@@ -36,7 +26,7 @@ pub struct GeoBounds {
 }
 
 impl GeoBounds {
-    /// Degenerate box around a single point (`h91(double,double)`).
+    /// Create a degenerate box around a single point.
     pub fn from_point(lat: f64, lon: f64) -> Self {
         GeoBounds {
             north: lat,
@@ -46,9 +36,7 @@ impl GeoBounds {
         }
     }
 
-    /// Port of `h91.m4448n()`.  The original's `else if` is safe only because
-    /// the box starts out collapsed onto the first sample — a point can never
-    /// be both the new minimum and the new maximum — and is reproduced as is.
+    /// Extend the bounds to include a finite point.
     pub fn extend(&mut self, lat: f64, lon: f64) {
         if !(lat.is_finite() && lon.is_finite()) {
             return;
@@ -65,6 +53,10 @@ impl GeoBounds {
         }
     }
 
+    /// Build bounds from the first point and extend them with the rest.
+    ///
+    /// Returns `None` when the iterator is empty. Non-finite points after the
+    /// first are ignored by [`Self::extend`].
     pub fn from_points<I: IntoIterator<Item = (f64, f64)>>(points: I) -> Option<Self> {
         let mut it = points.into_iter();
         let (lat0, lon0) = it.next()?;
@@ -76,16 +68,22 @@ impl GeoBounds {
     }
 
     #[inline]
+    /// Midpoint of the latitude span in degree space.
+    ///
+    /// This is the arithmetic centre of the box, not a Mercator-projected
+    /// midpoint; the projection itself is handled by [`MercatorView::fit`].
     pub fn mid_lat(&self) -> f64 {
         self.south / 2.0 + self.north / 2.0
     }
 
     #[inline]
+    /// Midpoint of the longitude span in degree space.
     pub fn mid_lon(&self) -> f64 {
         self.west / 2.0 + self.east / 2.0
     }
 
     #[inline]
+    /// Whether all four stored edges are finite.
     pub fn is_valid(&self) -> bool {
         self.north.is_finite()
             && self.south.is_finite()
@@ -98,18 +96,17 @@ impl GeoBounds {
 /// top-left corner of the visible rect in projected pixel space.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct MercatorView {
-    /// `h91.f6655a` in its viewport role — the reference size the zoom clamp is
-    /// expressed against.  RaceChrono passes the short side of the layer.
+    /// Reference size used by the zoom clamp.
     base: f64,
-    /// `h91.f6656b` — pixels per radian.
+    /// Pixels per radian.
     scale: f64,
-    /// `h91.f6657c` / `f6658d` — the projected point drawn at (0, 0).
+    /// Projected point drawn at (0, 0).
     origin_x: f64,
     origin_y: f64,
 }
 
 impl MercatorView {
-    /// Port of `h91(int)`: the default scale corresponds to a 1048576 px world.
+    /// Create a viewport whose default scale corresponds to a 1048576 px world.
     pub fn new(base: u32) -> Self {
         let base = base as f64;
         MercatorView {
@@ -120,33 +117,28 @@ impl MercatorView {
         }
     }
 
-    /// Port of the static `h91.m4435a()`: Mercator y for a latitude in radians,
-    /// offset so y = 0 sits at the north-pole clamp.  `sin(phi)` is clamped to
-    /// ±0.9999 exactly as in the original, which is what keeps the poles finite.
+    /// Convert latitude in radians to Mercator y.  Clamping `sin(phi)` to
+    /// ±0.9999 keeps the poles finite.
     #[inline]
     fn mercator_y(phi_rad: f64, scale: f64) -> f64 {
         let s = phi_rad.sin().clamp(-0.9999, 0.9999);
         (PI - (((s + 1.0) / (1.0 - s)).ln() * 0.5)) * scale
     }
 
-    /// Port of `h91.m4441f()`: longitude -> x pixel.
+    /// Convert longitude in degrees to an x pixel.
     #[inline]
     pub fn project_x(&self, lon_deg: f64) -> f32 {
         (((lon_deg.to_radians() + PI) * self.scale) - self.origin_x) as f32
     }
 
-    /// Port of `h91.m4442g()`: latitude -> y pixel.
+    /// Convert latitude in degrees to a y pixel.
     #[inline]
     pub fn project_y(&self, lat_deg: f64) -> f32 {
         (Self::mercator_y(lat_deg.to_radians(), self.scale) - self.origin_y) as f32
     }
 
-    /// Port of `h91.m4445k()` — fit `bounds` into a `width` × `height` rect with
-    /// `margin` px of padding on every side, then centre it.
-    ///
-    /// The original also takes a min/max zoom pair; the map gauge passes
-    /// `0.0` and [`MAX_ZOOM`], i.e. a lower bound that never binds, so only the
-    /// ceiling is kept here.
+    /// Fit `bounds` into a `width` × `height` rectangle with `margin` pixels of
+    /// padding on every side, then centre it.
     pub fn fit(&mut self, bounds: &GeoBounds, margin: f32, width: f32, height: f32) {
         let pad = margin * 2.0;
 

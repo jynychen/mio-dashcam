@@ -1,26 +1,15 @@
 //! Derived motion channels, and the playback cursor that moves the marker.
 //!
-//! Ported from `rc_map_overlay/src/motion.rs`.  For a GPS device with no IMU —
-//! which is exactly what a dashcam's receiver is — RaceChrono derives its
-//! motion channels from position, speed and bearing alone (`p000/cs1.java`):
+//! Motion channels are derived from position, speed, and bearing:
 //!
-//! ```text
-//! ch 7  Lateral acceleration     avg(interpolate(gpsLatAcc(bearing, speed)), 1.200)
-//! ch 8  Longitudinal accel.      avg(interpolate(gpsLongAcc(speed)), 1.200)
-//! ch 37 Lean angle               avg(interpolate(gpsLeanAngle(latAcc)), 1.200)
-//! ch 43 Combined acceleration    sqrt(pow2(latAcc_avg) + pow2(longAcc_avg))
-//! ```
+//! Lateral acceleration is `-speed × angular_rate`; longitudinal acceleration
+//! is the finite difference of speed. Both channels are smoothed with a centred
+//! 1.2-second average. The bearing used for angular rate is unwrapped first so
+//! crossing north does not produce a 360 °/s jump.
 //!
-//! where the bearing feeding `gpsLatAcc` is `interpolate(unwrap(bearing))` —
-//! unwrapped first, or every crossing of north would read as a 360 °/s yaw
-//! rate.  The two acceleration channels are kept below; lean angle and combined
-//! acceleration are motorcycle gauges and are left out.
-//!
-//! The playback half is what replaced this crate's cubic splines.  RaceChrono
-//! plays a session back with `interpolate()`, a plain linear interpolation with
-//! a maximum bridgeable gap: between two records the marker moves at a constant
-//! rate, and across a dropout longer than the gap it disappears instead of
-//! following a curve nobody drove.
+//! Playback uses linear interpolation with a maximum bridgeable gap: between
+//! two records the marker moves at a constant rate, and across a longer
+//! dropout it disappears instead of being extrapolated.
 
 use crate::filters::{
     self, QuickInterpolator, centred_average, gps_lateral_acceleration,
@@ -28,11 +17,11 @@ use crate::filters::{
 };
 use crate::gps::Fix;
 
-/// Smoothing window `cs1` applies to the GPS-derived motion channels.
+/// Smoothing window for GPS-derived motion channels.
 const AVG_WINDOW_S: f64 = 1.2;
 
-/// The motion channels of one session: the raw inputs, resampled onto parallel
-/// arrays, plus what is derived from them.
+/// The motion channels of one session, stored as parallel arrays: the input
+/// fixes plus the derived acceleration channels.
 #[derive(Debug, Clone, Default)]
 pub struct MotionSeries {
     /// Seconds from the start of the concatenated session.
@@ -51,7 +40,8 @@ pub struct MotionSeries {
     /// that the vehicle has no heading at all; this keeps the holes, purely as
     /// a mask for [`MotionPlayer`].
     bearing_raw: Vec<f64>,
-    /// Lateral acceleration, m/s²; negative in a left-hand corner.
+    /// Lateral acceleration, m/s²; negative for an increasing (right-hand)
+    /// bearing.
     pub lateral_acc: Vec<f64>,
     /// Longitudinal acceleration, m/s²; negative under braking.
     pub longitudinal_acc: Vec<f64>,
@@ -135,8 +125,9 @@ pub fn extremes(values: &[f64]) -> Option<(f64, f64)> {
         })
 }
 
-/// Position and heading at an arbitrary time, via `interpolate()` — this is
-/// what makes the marker glide between two 1 Hz records.
+/// Position and heading at an arbitrary time via the interpolation state built
+/// by [`MotionSeries::player`]. This is what makes the marker glide between two
+/// 1 Hz records without extrapolating across a gap.
 pub struct MotionPlayer<'a> {
     lat: QuickInterpolator<'a>,
     lon: QuickInterpolator<'a>,
@@ -149,9 +140,7 @@ pub struct MotionPlayer<'a> {
 pub struct MotionState {
     pub lat: f64,
     pub lon: f64,
-    /// Degrees, still unwrapped, or `None` where the vehicle has no heading —
-    /// the same distinction `ex1` makes when it draws a circle instead of an
-    /// arrow, except that here it survives playback.
+    /// Degrees, still unwrapped, or `None` when the heading is unknown.
     pub bearing: Option<f64>,
 }
 

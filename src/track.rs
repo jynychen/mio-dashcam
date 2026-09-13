@@ -1,21 +1,14 @@
 //! What the overlay draws, in pixel space: the trace, and one marker per frame.
 //!
-//! This is the geometry half of `rc_map_overlay/src/gauge.rs` — RaceChrono's
-//! map gauge, `p000/ex1.java` — which does three things before any pixel is
-//! touched:
+//! The geometry pipeline performs three operations before any pixel is touched:
 //!
-//! 1. thin the samples ([`Decimation`], from `lx2.m5741o(0.2, 3.0, 20, 2)`),
+//! 1. thin the samples ([`Decimation`]),
 //! 2. fit a [`MercatorView`] around what survives, with a margin,
 //! 3. project the polyline and the position marker into that viewport.
 //!
-//! The painting half stays in [`crate::overlay`], which draws mio's own style
-//! rather than RaceChrono's white-line-on-black-outline.
-//!
-//! One addition the gauge has no need for: `ex1` draws a static lap, while an
-//! overlay video redraws the same trace 30 times a second with the split
-//! between "already driven" and "still ahead" moving along it.  Each drawn
-//! segment therefore carries the time span it covers, and long segments are
-//! subdivided so that split can land mid-second.
+//! The painting half stays in [`crate::overlay`]. Each segment carries its time
+//! span, and long segments are subdivided so the driven/future split can land
+//! between samples.
 
 use crate::gps::{Fix, PositionSource, Session};
 use crate::mercator::{GeoBounds, MercatorView};
@@ -30,23 +23,18 @@ const PADDING_RATIO: f32 = 0.05;
 /// on where the track stops existing.
 const MAX_GAP_S: f64 = 10.0;
 
-/// Sample thinning, from `lx2.m5741o(0.2, 3.0, 20, 2)`: keep a sample once it
-/// is both `min_time_s` and `min_distance_m` away from the last one kept.
-///
-/// Which of the two conditions the native resampler joins with could not be
-/// read off the Java source, but "both" is the behaviour that matches the
-/// gauge in practice — and it is what matters here, because a dashcam spends a
-/// good part of its life at a red light, where a 1 Hz log piles hundreds of
-/// jittering samples onto one pixel.
+/// Keep a sample once it is both `min_time_s` and `min_distance_m` away from
+/// the last one kept.
 #[derive(Debug, Clone, Copy)]
 pub struct Decimation {
     pub min_time_s: f64,
     pub min_distance_m: f64,
-    /// Hard cap on kept samples (`lx2.m5737k(..., 72000, 1)`).
+    /// Hard cap on kept samples.
     pub max_samples: usize,
 }
 
 impl Default for Decimation {
+    /// Use the renderer's default time, distance, and sample-count limits.
     fn default() -> Self {
         Decimation {
             min_time_s: 0.2,
@@ -57,6 +45,10 @@ impl Default for Decimation {
 }
 
 impl Decimation {
+    /// Return references to fixes that satisfy both thinning thresholds.
+    ///
+    /// The final fix is retained when the sample cap has not already stopped
+    /// the scan, so the returned trace reaches the end of the drive.
     pub fn apply<'a>(&self, fixes: &'a [Fix]) -> Vec<&'a Fix> {
         let mut out: Vec<&Fix> = Vec::new();
         for f in fixes {
@@ -128,7 +120,8 @@ pub struct TrackLayout {
 /// Project a session into a square frame: the trace plus `duration × fps`
 /// markers.
 ///
-/// `None` when the drive holds too few positions to fit a viewport around.
+/// Returns `None` when there are not enough kept fixes to build a valid
+/// viewport, or when the final bounds collapse to an invalid geometry.
 pub fn build(
     session: &Session,
     motion: &MotionSeries,

@@ -158,7 +158,10 @@ pub struct Composite<'a> {
 }
 
 /// Build the final video: rear camera as picture-in-picture over the front
-/// camera, GPS track in the corner, audio normalized.
+/// camera, GPS track in the corner, and optionally normalized audio.
+///
+/// When `loudness` is `None`, the front audio stream is copied through the
+/// filter graph without normalization.
 pub fn compose(spec: &Composite) -> Result<()> {
     let mut args: Vec<String> = ["-y", "-loglevel", "warning", "-stats"]
         .into_iter()

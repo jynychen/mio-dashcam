@@ -1,16 +1,7 @@
-//! Ports of the RaceChrono channel filters the overlay needs.
+//! Numerical filters used to derive motion channels from sampled data.
 //!
-//! Lifted from `rc_map_overlay/src/filters.rs`, a Rust port of the operators
-//! inside `libRaceChronoEngine.so` (RaceChrono 10.2.4).  The APK's equation
-//! strings only ever *name* these — `interpolate()`, `unwrap()`, `avg()`,
-//! `gpsLatAcc()`, `gpsLongAcc()` — and the implementations were read off the
-//! stripped native binary.  Each doc comment keeps the original's pseudo-code,
-//! so the behaviour stays checkable against that disassembly.
-//!
-//! Two deliberate deviations from the port: a series is a pair of parallel
-//! `x` / `value` slices instead of one interleaved sample array, which is the
-//! shape a [`MotionSeries`](crate::motion::MotionSeries) already has; and the
-//! motorcycle-only `gpsLeanAngle()` / `magnitude()` filters are left out.
+//! Series are represented by parallel `x` and `value` slices.  The filters
+//! cover angle wrapping, acceleration, centred averaging, and interpolation.
 
 /// Standard gravity — the constant the two GPS acceleration filters clip
 /// against, and the unit accelerations are reported in.
@@ -20,7 +11,7 @@ pub const G: f64 = 9.80665;
 /// position glitch would otherwise show up as a wall of acceleration.
 const ACC_LIMIT: f64 = G * 10.0;
 
-/// Port of the angle normaliser at `0xd8590`: wrap radians into `(-PI, PI]`.
+/// Wrap radians into `(-PI, PI]`.
 ///
 /// ```text
 /// m = fmod(|v|, 2PI)
@@ -40,8 +31,8 @@ pub fn wrap_pi(v: f64) -> f64 {
     m
 }
 
-/// Port of `CoreUnwrapFilter` (`0x10e8d0`), which makes a wrapping angle series
-/// continuous *in degrees* before it is interpolated or differentiated:
+/// Make a wrapping angle series continuous in degrees before interpolation or
+/// differentiation:
 ///
 /// ```text
 /// delta = v - previous_output
@@ -76,8 +67,7 @@ fn ieee_remainder(x: f64, y: f64) -> f64 {
     x - y * (x / y).round_ties_even()
 }
 
-/// Port of `CoreGpsLateralAccelerationFilter::value(i)` (`0x100aa0`) —
-/// `gpsLatAcc(bearing, speed)`.
+/// Compute lateral acceleration from bearing and speed.
 ///
 /// ```text
 /// d_bearing = wrap_pi(deg_to_rad(bearing[i] - bearing[i-1]))
@@ -104,8 +94,7 @@ pub fn gps_lateral_acceleration(
     }
 }
 
-/// Port of `CoreGpsLongitudinalAccelerationFilter::value(i)` (`0x10113c`) —
-/// `gpsLongAcc(speed)`.
+/// Compute longitudinal acceleration from two speed samples.
 ///
 /// ```text
 /// if x[i-1] >= x[i] -> NaN            // x must be strictly increasing
@@ -124,14 +113,8 @@ pub fn gps_longitudinal_acceleration(speed_prev: f64, speed: f64, x_prev: f64, x
     }
 }
 
-/// `avg(channel, window)` — approximation of `CoreWeighedAverageFilter`
-/// (`0xf91e4`).
-///
-/// The native filter walks backwards and forwards from sample `i` while
-/// `|x[i] - x[j]|` stays inside the window, so it is a **centred** window over
-/// the x-axis; the exact weighting and edge handling were not recovered from
-/// the disassembly.  This takes the unweighted mean of every sample within
-/// `window` of the centre — close enough for smoothing, not bit-exact.
+/// Compute the unweighted mean of samples within `window` of each x-coordinate.
+/// NaN values are ignored; an all-NaN window produces NaN.
 pub fn centred_average(x: &[f64], values: &[f64], window: f64) -> Vec<f64> {
     debug_assert_eq!(x.len(), values.len());
     let mut out = Vec::with_capacity(values.len());
@@ -157,16 +140,12 @@ pub fn centred_average(x: &[f64], values: &[f64], window: f64) -> Vec<f64> {
     out
 }
 
-/// Port of `CoreQuickInterpolateFilter` (`0x103990`) — the `interpolate()`
-/// operator, and the thing that moves the marker between two GPS records.
-///
-/// For a wanted `x` it finds the bracketing pair `lo`/`lo+1` in the source
-/// series (the original caches the last index, hence "quick"), then:
+/// Linearly interpolate a value at `x` using the bracketing pair `lo`/`lo+1`:
 ///
 /// ```text
 /// t = (x - x_lo) / (x_hi - x_lo)     // 0 when x_hi == x_lo
 /// t = clamp(t, 0, 1)
-/// value = v_lo + (v_hi - v_lo) * t   // fmadd
+/// value = v_lo + (v_hi - v_lo) * t
 /// ```
 ///
 /// Outside the series, or across a hole wider than `max_gap`, the answer is
@@ -179,12 +158,13 @@ pub struct QuickInterpolator<'a> {
     values: &'a [f64],
     cursor: usize,
     max_gap: f64,
-    /// `false` is the filter's sample-and-hold mode (field `0x68`): the value
-    /// of the preceding sample rather than a blend of the bracketing pair.
+    /// `false` selects sample-and-hold mode: the value of the preceding sample
+    /// rather than a blend of the bracketing pair.
     interpolate: bool,
 }
 
 impl<'a> QuickInterpolator<'a> {
+    /// Create a linear interpolator over paired, ordered coordinates and values.
     pub fn new(x: &'a [f64], values: &'a [f64]) -> Self {
         debug_assert_eq!(x.len(), values.len());
         QuickInterpolator {
@@ -196,6 +176,7 @@ impl<'a> QuickInterpolator<'a> {
         }
     }
 
+    /// Reject interpolation across intervals longer than `max_gap`.
     pub fn with_max_gap(mut self, max_gap: f64) -> Self {
         self.max_gap = max_gap;
         self
@@ -215,7 +196,7 @@ impl<'a> QuickInterpolator<'a> {
             return f64::NAN;
         }
 
-        // Cached forward/backward scan, like the filter's index cache.
+        // Cached forward/backward scan keeps increasing queries near O(1).
         let mut lo = self.cursor.min(n - 2);
         while lo + 1 < n - 1 && self.x[lo + 1] <= x {
             lo += 1;
@@ -247,7 +228,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn wrap_pi_matches_native_range() {
+    fn wrap_pi_matches_expected_range() {
         use std::f64::consts::PI;
         assert!((wrap_pi(0.0) - 0.0).abs() < 1e-12);
         assert!((wrap_pi(PI) - PI).abs() < 1e-12);
@@ -328,8 +309,7 @@ mod tests {
         // A hole starts at its own sample and runs up to the next one.
         assert!(h.value_at(1.0).is_nan());
         assert!(h.value_at(2.9).is_nan());
-        // The very last sample still holds its predecessor: there is no pair
-        // beyond it to step into. The original behaves the same way.
+        // The very last sample has no pair beyond it to step into.
         assert!(h.value_at(3.0).is_nan());
     }
 }

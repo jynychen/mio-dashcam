@@ -152,7 +152,11 @@ fn same_size(a: &Path, b: &Path) -> Result<bool> {
     Ok(a.metadata()?.len() == b.metadata()?.len())
 }
 
-/// Move or copy one file, never overwriting an existing target.
+/// Move or copy one file while guarding against overwriting an existing target.
+///
+/// The caller checks for collisions before this helper runs, so the helper can
+/// assume a unique destination file and still keep the filesystem operation
+/// atomic from the caller's point of view.
 fn transfer(from: &Path, to: &Path, mode: Mode) -> Result<()> {
     match mode {
         // A rename only works within one filesystem, and the common case here
