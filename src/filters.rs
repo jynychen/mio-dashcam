@@ -189,10 +189,25 @@ impl<'a> QuickInterpolator<'a> {
         self
     }
 
-    /// Value at `x`; NaN outside the series or across a gap wider than `max_gap`.
+    /// Value at `x`; NaN outside the series, across a gap wider than
+    /// `max_gap`, or when the x-axis contains a non-finite/reversed interval.
     pub fn value_at(&mut self, x: f64) -> f64 {
         let n = self.x.len();
-        if n < 2 || x < self.x[0] || x > self.x[n - 1] {
+        if n == 0 || !x.is_finite() {
+            return f64::NAN;
+        }
+        // An isolated sample is valid only at its own x coordinate; it must
+        // never be extrapolated.
+        if n == 1 {
+            return (self.x[0] == x)
+                .then_some(self.values[0])
+                .unwrap_or(f64::NAN);
+        }
+        if !self.x[0].is_finite()
+            || !self.x[n - 1].is_finite()
+            || x < self.x[0]
+            || x > self.x[n - 1]
+        {
             return f64::NAN;
         }
 
@@ -207,7 +222,10 @@ impl<'a> QuickInterpolator<'a> {
         self.cursor = lo;
 
         let (x0, x1) = (self.x[lo], self.x[lo + 1]);
-        if x1 - x0 > self.max_gap {
+        // An equal-x pair evaluates to the first value (t = 0); only a
+        // reversed interval is invalid here. The acceleration filters remain
+        // stricter and reject x1 <= x0 because they divide by the interval.
+        if !x0.is_finite() || !x1.is_finite() || x1 < x0 || x1 - x0 > self.max_gap {
             return f64::NAN;
         }
         let (v0, v1) = (self.values[lo], self.values[lo + 1]);
@@ -298,6 +316,35 @@ mod tests {
         let mut gapped = QuickInterpolator::new(&x, &v).with_max_gap(1.5);
         assert!((gapped.value_at(0.5) - 5.0).abs() < 1e-9);
         assert!(gapped.value_at(2.0).is_nan());
+    }
+
+    #[test]
+    fn a_single_sample_is_only_valid_at_its_timestamp() {
+        let x = [2.0];
+        let values = [7.0];
+        let mut q = QuickInterpolator::new(&x, &values);
+        assert_eq!(q.value_at(2.0), 7.0);
+        assert!(q.value_at(1.999).is_nan());
+        assert!(q.value_at(2.001).is_nan());
+    }
+
+    #[test]
+    fn non_finite_query_or_timestamp_is_rejected() {
+        let x = [0.0, 1.0];
+        let values = [1.0, 2.0];
+        let mut q = QuickInterpolator::new(&x, &values);
+        assert!(q.value_at(f64::NAN).is_nan());
+        assert!(q.value_at(f64::INFINITY).is_nan());
+
+        let duplicate_x = [1.0, 1.0];
+        let duplicate_values = [1.0, 2.0];
+        let mut q = QuickInterpolator::new(&duplicate_x, &duplicate_values);
+        assert_eq!(q.value_at(1.0), 1.0);
+
+        let malformed_x = [2.0, 1.0];
+        let malformed_values = [1.0, 2.0];
+        let mut q = QuickInterpolator::new(&malformed_x, &malformed_values);
+        assert!(q.value_at(1.5).is_nan());
     }
 
     #[test]

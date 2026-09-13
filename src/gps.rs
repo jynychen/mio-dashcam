@@ -95,9 +95,16 @@ pub fn load_session(group: &Group, tz: Option<FixedOffset>) -> Result<Session> {
     let mut parsed: Vec<(usize, Vec<nmea::Rmc>)> = Vec::new();
     for (idx, clip) in group.clips.iter().enumerate() {
         if let Some(path) = &clip.nmea {
-            let records = nmea::parse_file(path)?;
-            if !records.is_empty() {
-                parsed.push((idx, records));
+            // Treat a sidecar failure as a per-clip GPS input failure.  Keep
+            // the rest of the video session and let the missing sidecar form
+            // a gap that the interpolator will refuse to bridge.
+            match nmea::parse_file(path) {
+                Ok(records) if !records.is_empty() => parsed.push((idx, records)),
+                Ok(_) => eprintln!("warning: no usable RMC records in {}", path.display()),
+                Err(error) => eprintln!(
+                    "warning: skipping GPS sidecar {}: {error:#}",
+                    path.display()
+                ),
             }
         }
     }
@@ -151,13 +158,21 @@ fn fix_from(t: f64, r: &nmea::Rmc) -> Option<Fix> {
         return None;
     }
     // The log is in km/h; every derived channel wants m/s.
-    let speed = r.speed / 3.6;
+    // Missing optional channels remain NaN.  Do not turn an unknown value into
+    // zero: the filters propagate an invalid channel independently of the
+    // valid position channel.
+    let speed = r
+        .speed
+        .is_finite()
+        .then_some(r.speed / 3.6)
+        .unwrap_or(f64::NAN);
+    let bearing = r.track.is_finite().then_some(r.track).unwrap_or(f64::NAN);
     Some(Fix {
         t,
         lat: r.lat,
         lon: r.lon,
         speed,
-        bearing: r.track,
+        bearing,
         dist: 0.0,
     })
 }
