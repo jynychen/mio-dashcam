@@ -14,12 +14,6 @@ const LOUDNORM_TARGET: &str = "I=-16:TP=-1.5:LRA=20";
 /// Height the rear picture-in-picture is scaled to, in pixels.
 pub const DEFAULT_PIP_HEIGHT: u32 = 432;
 
-/// Gap between the GPS overlay and the bottom edge of the frame, as a fraction
-/// of frame height — enough to clear the camera's burnt-in status line *and*
-/// the Mio watermark above it (which reaches about 7% up a 2160p frame).
-/// Expressed relatively so it holds if the recording resolution changes.
-const OVERLAY_BOTTOM_MARGIN: &str = "H/12";
-
 /// Concatenate `paths` without re-encoding.
 ///
 /// Only the first video stream is kept: Mio clips also carry a low-resolution
@@ -154,7 +148,7 @@ pub struct Composite<'a> {
     pub front: &'a Path,
     /// Rear camera, overlaid on the top centre of the frame.
     pub rear: Option<&'a Path>,
-    /// GPS track overlay, placed in the bottom-right corner.
+    /// GPS track overlay, placed in the top-right corner.
     pub overlay: Option<&'a Path>,
     pub output: &'a Path,
     /// Height of the rear picture-in-picture.
@@ -201,9 +195,11 @@ pub fn compose(spec: &Composite) -> Result<()> {
         last = "base".into();
     }
     if let Some(idx) = overlay_idx {
-        chain.push(format!(
-            "[{last}][{idx}:v:0]overlay=W-w:H-h-{OVERLAY_BOTTOM_MARGIN}[withgps]"
-        ));
+        // Flush into the top-right corner, the only one free of the camera's own
+        // graphics: the bottom carries a burnt-in status line and the Mio
+        // watermark, and the rear picture-in-picture takes the top centre. The
+        // overlay carries its own blank padding, so it needs no further inset.
+        chain.push(format!("[{last}][{idx}:v:0]overlay=W-w:0[withgps]"));
         last = "withgps".into();
     }
     // Give the video a stable label even when nothing was composited onto it.

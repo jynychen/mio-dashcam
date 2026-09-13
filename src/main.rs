@@ -68,7 +68,7 @@ enum Command {
         #[arg(long)]
         no_gps: bool,
 
-        /// Draw the track overlay at 1920px instead of the default 480px
+        /// Draw the track overlay at 1920px instead of the default 540px
         #[arg(long)]
         big: bool,
 
@@ -178,7 +178,7 @@ fn main() -> Result<()> {
             let opts = RenderOptions {
                 output: &output,
                 gps: !no_gps,
-                overlay_size: if big { 1920 } else { 480 },
+                overlay_size: if big { 1920 } else { 540 },
                 keep,
                 skip_existing,
                 pip_height,

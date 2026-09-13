@@ -29,9 +29,9 @@ const FADE_SECS: f64 = 0.25;
 // Conversion to premultiplied sRGB u8 happens once, in the final pass.
 
 /// SDF radius (half-width) of the not-yet-driven track.
-const TRACK_RADIUS_THIN: f32 = 2.0;
+const TRACK_RADIUS_THIN: f32 = 3.0;
 /// SDF radius of the already-driven track.
-const TRACK_RADIUS_THICK: f32 = 3.0;
+const TRACK_RADIUS_THICK: f32 = 4.0;
 /// How far the arrow tip reaches ahead of the position.
 const ARROW_FRONT: f32 = 10.0;
 /// How far the arrow's base corners sit behind the position.
@@ -39,9 +39,9 @@ const ARROW_BACK: f32 = 6.0;
 /// Depth of the notch cut into the arrow's base; must be under `ARROW_BACK`.
 const ARROW_NOTCH_BACK: f32 = 3.0;
 /// Half-width of the arrow base.
-const ARROW_HALF_BASE: f32 = 6.0;
+const ARROW_HALF_BASE: f32 = 7.0;
 /// Outline drawn around the arrow so it stays readable over a bright road.
-const ARROW_OUTLINE: f32 = 1.5;
+const ARROW_OUTLINE: f32 = 2.0;
 
 /// Pixel (px, py) is sampled at its centre, following the usual
 /// half-open-interval convention where pixel i covers [i, i+1).
